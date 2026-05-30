@@ -12,10 +12,8 @@
 #include <vector>
 #include <esp_http_client.h>
 #include <esp_log.h>
-#include <esp_netif.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <ArduinoJson.hpp>
 #include <stackchan/stackchan.h>
 #include "hal/board/hal_bridge.h"
 #include <board.h>
@@ -321,22 +319,23 @@ LauncherView::~LauncherView()
 }
 
 /* -------------------------------------------------------------------------- */
-/*            Local STT + LLM + TTS 会話ループ (POST /stt-chat-tts)           */
+/*            音声会話ループ: マイク録音 → STT → LLM → TTS 再生              */
 /* -------------------------------------------------------------------------- */
-// pi5-3.local FastAPI エンドポイント
-// STT-chat-TTS: raw WAV body → Whisper → Ollama → VOICEVOX → WAV response
-#define LOCAL_STT_TTS_URL   "http://192.168.1.235:8000/stt-chat-tts"
-#define TTS_WAV_BUF_SIZE    (256 * 1024)  // TTS応答用 256KB PSRAM
-#define WAV_HEADER_SIZE     44
 
-// STT録音パラメータ（16000Hz mono, 4秒）
-#define STT_SAMPLE_RATE     16000
-#define STT_RECORD_SEC      4
-#define STT_RECORD_SAMPLES  (STT_SAMPLE_RATE * STT_RECORD_SEC)
-// 録音WAVバッファ: WAVヘッダー + PCMデータ
-#define STT_WAV_BUF_SIZE    (WAV_HEADER_SIZE + STT_RECORD_SAMPLES * 2)
+// ── サーバー設定（IPアドレスは環境に合わせて変更） ──
+static constexpr char   kSttTtsUrl[]      = "http://192.168.1.235:8000/stt-chat-tts";
 
-static const char* LOCAL_LLM_TAG = "LocalLLM";
+// ── 録音パラメータ（16kHz mono） ──
+static constexpr int    kSttSampleRate    = 16000;
+static constexpr int    kSttRecordSec     = 4;          // 録音秒数
+static constexpr size_t kSttRecordSamples = kSttSampleRate * kSttRecordSec;
+
+// ── バッファサイズ ──
+static constexpr size_t kWavHeaderSize    = 44;
+static constexpr size_t kSttWavBufSize    = kWavHeaderSize + kSttRecordSamples * 2; // ~128KB
+static constexpr size_t kTtsWavBufSize    = 512 * 1024;  // TTS応答最大 512KB
+
+static constexpr char   kTag[]            = "VoiceChat";
 
 // STT+TTS応答を受け取るコンテキスト
 struct SttTtsRespCtx {
@@ -378,6 +377,7 @@ static esp_err_t stt_tts_http_handler(esp_http_client_event_t* evt)
     if (!ctx) return ESP_OK;
     switch (evt->event_id) {
         case HTTP_EVENT_ON_HEADER:
+            // X-Emotion: happy / thinking / confused / idle など
             if (evt->header_key && strcasecmp(evt->header_key, "X-Emotion") == 0 && evt->header_value) {
                 strncpy(ctx->emotion, evt->header_value, sizeof(ctx->emotion) - 1);
                 ctx->emotion[sizeof(ctx->emotion) - 1] = '\0';
@@ -385,12 +385,9 @@ static esp_err_t stt_tts_http_handler(esp_http_client_event_t* evt)
             break;
         case HTTP_EVENT_ON_DATA:
             if (evt->data && evt->data_len > 0 && ctx->buf) {
-                size_t space = ctx->max_len - ctx->len;
-                size_t n = ((size_t)evt->data_len < space) ? (size_t)evt->data_len : space;
-                if (n > 0) {
-                    memcpy(ctx->buf + ctx->len, evt->data, n);
-                    ctx->len += n;
-                }
+                size_t n = std::min((size_t)evt->data_len, ctx->max_len - ctx->len);
+                memcpy(ctx->buf + ctx->len, evt->data, n);
+                ctx->len += n;
             }
             break;
         default:
@@ -419,135 +416,133 @@ static bool wait_for_avatar()
 // WAV 再生（PCM を AudioCodec に流す）
 static void play_wav(const uint8_t* wav_buf, size_t wav_len)
 {
-    if (wav_len <= WAV_HEADER_SIZE) {
-        ESP_LOGW(LOCAL_LLM_TAG, "WAV too small: %u", (unsigned)wav_len);
+    if (wav_len <= kWavHeaderSize) {
+        ESP_LOGW(kTag, "WAV too small: %u bytes", (unsigned)wav_len);
         return;
     }
-    auto* audio_codec = Board::GetInstance().GetAudioCodec();
-    if (!audio_codec) {
-        ESP_LOGE(LOCAL_LLM_TAG, "AudioCodec unavailable");
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (!codec) {
+        ESP_LOGE(kTag, "AudioCodec unavailable");
         return;
     }
-    const int16_t* pcm          = reinterpret_cast<const int16_t*>(wav_buf + WAV_HEADER_SIZE);
-    size_t         total_samples = (wav_len - WAV_HEADER_SIZE) / sizeof(int16_t);
-    const size_t   kChunk        = 512;
+    const int16_t* pcm     = reinterpret_cast<const int16_t*>(wav_buf + kWavHeaderSize);
+    size_t         samples = (wav_len - kWavHeaderSize) / sizeof(int16_t);
 
-    audio_codec->EnableOutput(true);
-    size_t offset = 0;
-    while (offset < total_samples) {
-        size_t n = std::min(kChunk, total_samples - offset);
+    codec->EnableOutput(true);
+    for (size_t offset = 0; offset < samples; ) {
+        size_t n = std::min<size_t>(512, samples - offset);
         std::vector<int16_t> chunk(pcm + offset, pcm + offset + n);
-        audio_codec->OutputData(chunk);
+        codec->OutputData(chunk);
         offset += n;
     }
-    audio_codec->EnableOutput(false);
+    codec->EnableOutput(false);
 }
 
-// 1回の会話ループ:
-//   1. マイクから STT_RECORD_SEC 秒録音 (AudioService tee)
-//   2. WAV を POST /stt-chat-tts
-//   3. 返ってきた WAV を再生
+// emotion 文字列 → stackchan::avatar::Emotion 変換
+static stackchan::avatar::Emotion emotion_from_string(const char* s)
+{
+    if (!s || !s[0]) return stackchan::avatar::Emotion::Neutral;
+    if (strcmp(s, "happy")    == 0) return stackchan::avatar::Emotion::Happy;
+    if (strcmp(s, "sad")      == 0) return stackchan::avatar::Emotion::Sad;
+    if (strcmp(s, "angry")    == 0) return stackchan::avatar::Emotion::Angry;
+    if (strcmp(s, "sleepy")   == 0) return stackchan::avatar::Emotion::Sleepy;
+    // thinking / confused / doubt → Doubt
+    if (strcmp(s, "thinking") == 0 || strcmp(s, "confused") == 0) return stackchan::avatar::Emotion::Doubt;
+    return stackchan::avatar::Emotion::Neutral;
+}
+
+// 1回の音声会話:
+//   録音(kSttRecordSec秒) → WAV構築 → POST /stt-chat-tts → WAV再生
 static bool do_stt_voice_chat()
 {
-    // ── 1. STT録音バッファ確保 (WAVヘッダー44B + PCM) ──
-    uint8_t* stt_wav_buf = static_cast<uint8_t*>(
-        heap_caps_malloc(STT_WAV_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!stt_wav_buf) {
-        ESP_LOGE(LOCAL_LLM_TAG, "STT WAV alloc failed");
+    auto& audio_svc = Application::GetInstance().GetAudioService();
+    auto& sc        = GetStackChan();
+
+    // ── 1. 録音バッファ確保 (WAVヘッダー + PCM, PSRAM) ──
+    uint8_t* stt_buf = static_cast<uint8_t*>(
+        heap_caps_malloc(kSttWavBufSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!stt_buf) {
+        ESP_LOGE(kTag, "STT buf alloc failed (%u bytes)", (unsigned)kSttWavBufSize);
         return false;
     }
-    int16_t* pcm_buf = reinterpret_cast<int16_t*>(stt_wav_buf + WAV_HEADER_SIZE);
+    int16_t* pcm_buf = reinterpret_cast<int16_t*>(stt_buf + kWavHeaderSize);
 
-    // ── 2. 録音開始 ──
-    auto& audio_svc = Application::GetInstance().GetAudioService();
-    ESP_LOGI(LOCAL_LLM_TAG, "Recording %ds @ %dHz...", STT_RECORD_SEC, STT_SAMPLE_RATE);
-
-    // アバターに「聞いています」表情を設定
+    // ── 2. 録音（アバターに「聞き中」表情） ──
+    ESP_LOGI(kTag, "Recording %ds @ %dHz...", kSttRecordSec, kSttSampleRate);
     hal_bridge::disply_lvgl_lock();
-    auto& sc = GetStackChan();
     if (sc.hasAvatar()) {
         sc.addModifier(std::make_unique<stackchan::TimedEmotionModifier>(
-            stackchan::avatar::Emotion::Doubt, STT_RECORD_SEC * 1000 + 500));
+            stackchan::avatar::Emotion::Doubt, kSttRecordSec * 1000 + 500));
     }
     hal_bridge::disply_lvgl_unlock();
 
-    audio_svc.StartSttRecording(pcm_buf, STT_RECORD_SAMPLES);
-
-    // 録音完了まで待機（タイムアウト = STT_RECORD_SEC + 2秒）
-    const int kTimeoutMs = (STT_RECORD_SEC + 2) * 1000;
-    for (int elapsed = 0; !audio_svc.IsSttRecordingDone() && elapsed < kTimeoutMs; elapsed += 50) {
+    audio_svc.StartSttRecording(pcm_buf, kSttRecordSamples);
+    for (int t = 0; !audio_svc.IsSttRecordingDone() && t < (kSttRecordSec + 2) * 1000; t += 50) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     audio_svc.StopSttRecording();
 
     size_t recorded = audio_svc.GetSttRecordedCount();
-    ESP_LOGI(LOCAL_LLM_TAG, "Recorded %u samples", (unsigned)recorded);
-
+    ESP_LOGI(kTag, "Recorded %u samples", (unsigned)recorded);
     if (recorded == 0) {
-        ESP_LOGW(LOCAL_LLM_TAG, "No audio recorded, skipping");
-        heap_caps_free(stt_wav_buf);
+        ESP_LOGW(kTag, "No audio, skipping");
+        heap_caps_free(stt_buf);
         return false;
     }
 
-    // ── 3. WAVヘッダーを先頭に書き込む ──
-    uint32_t pcm_bytes = (uint32_t)(recorded * sizeof(int16_t));
-    build_wav_header(stt_wav_buf, pcm_bytes, STT_SAMPLE_RATE);
-    size_t wav_send_size = WAV_HEADER_SIZE + (size_t)pcm_bytes;
+    // ── 3. WAVヘッダー書き込み ──
+    uint32_t pcm_bytes    = (uint32_t)(recorded * sizeof(int16_t));
+    build_wav_header(stt_buf, pcm_bytes, kSttSampleRate);
+    size_t   wav_send_len = kWavHeaderSize + pcm_bytes;
 
-    // ── 4. TTS応答バッファを確保 ──
-    SttTtsRespCtx resp_ctx = {};
-    resp_ctx.max_len = TTS_WAV_BUF_SIZE;
-    resp_ctx.buf     = static_cast<uint8_t*>(
-        heap_caps_malloc(resp_ctx.max_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!resp_ctx.buf) {
-        ESP_LOGE(LOCAL_LLM_TAG, "TTS resp alloc failed");
-        heap_caps_free(stt_wav_buf);
+    // ── 4. TTS応答バッファ確保 ──
+    SttTtsRespCtx resp = {};
+    resp.max_len = kTtsWavBufSize;
+    resp.buf     = static_cast<uint8_t*>(
+        heap_caps_malloc(resp.max_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!resp.buf) {
+        ESP_LOGE(kTag, "TTS buf alloc failed");
+        heap_caps_free(stt_buf);
         return false;
     }
 
-    // ── 5. POST /stt-chat-tts (raw WAV body) ──
-    ESP_LOGI(LOCAL_LLM_TAG, "POST /stt-chat-tts: %u bytes...", (unsigned)wav_send_size);
-
+    // ── 5. POST /stt-chat-tts ──
+    ESP_LOGI(kTag, "POST %s (%u bytes)...", kSttTtsUrl, (unsigned)wav_send_len);
     esp_http_client_config_t cfg = {};
-    cfg.url           = LOCAL_STT_TTS_URL;
-    cfg.method        = HTTP_METHOD_POST;
-    cfg.timeout_ms    = 120000;  // STT + Ollama + VOICEVOX
-    cfg.user_data     = &resp_ctx;
-    cfg.event_handler = stt_tts_http_handler;
-    cfg.buffer_size   = 4096;
+    cfg.url            = kSttTtsUrl;
+    cfg.method         = HTTP_METHOD_POST;
+    cfg.timeout_ms     = 120000;   // STT + LLM + TTS で最大2分
+    cfg.user_data      = &resp;
+    cfg.event_handler  = stt_tts_http_handler;
+    cfg.buffer_size    = 4096;
     cfg.buffer_size_tx = 4096;
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
-        ESP_LOGE(LOCAL_LLM_TAG, "HTTP init failed");
-        heap_caps_free(stt_wav_buf);
-        heap_caps_free(resp_ctx.buf);
+        ESP_LOGE(kTag, "HTTP init failed");
+        heap_caps_free(stt_buf);
+        heap_caps_free(resp.buf);
         return false;
     }
-
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
-    esp_http_client_set_post_field(client, reinterpret_cast<const char*>(stt_wav_buf), (int)wav_send_size);
+    esp_http_client_set_post_field(client, reinterpret_cast<const char*>(stt_buf), (int)wav_send_len);
 
     esp_err_t err = esp_http_client_perform(client);
     esp_http_client_cleanup(client);
-    heap_caps_free(stt_wav_buf);
+    heap_caps_free(stt_buf);
 
     if (err != ESP_OK) {
-        ESP_LOGE(LOCAL_LLM_TAG, "HTTP POST failed: %s", esp_err_to_name(err));
-        heap_caps_free(resp_ctx.buf);
+        ESP_LOGE(kTag, "HTTP POST failed: %s", esp_err_to_name(err));
+        heap_caps_free(resp.buf);
         return false;
     }
-    ESP_LOGI(LOCAL_LLM_TAG, "Response: emotion=%s wav=%u bytes",
-             resp_ctx.emotion, (unsigned)resp_ctx.len);
+    ESP_LOGI(kTag, "Response: emotion=%s wav=%u bytes", resp.emotion, (unsigned)resp.len);
 
-    // ── 6. アバターに表情を設定し WAV 再生 ──
-    std::string emotion_str = resp_ctx.emotion[0] ? resp_ctx.emotion : "idle";
-    stackchan::avatar::Emotion emo = stackchan::avatar::Emotion::Neutral;
-    if (emotion_str == "happy")                        emo = stackchan::avatar::Emotion::Happy;
-    else if (emotion_str == "thinking" || emotion_str == "confused") emo = stackchan::avatar::Emotion::Doubt;
-
-    int speech_ms = (int)((resp_ctx.len - WAV_HEADER_SIZE) / sizeof(int16_t) * 1000 / 24000) + 1000;
-    if (speech_ms > 30000) speech_ms = 30000;
+    // ── 6. 表情設定 + WAV再生 ──
+    stackchan::avatar::Emotion emo = emotion_from_string(resp.emotion);
+    // VOICEVOX は 24kHz → speech_ms 計算に 24000 を使用
+    int speech_ms = (int)((resp.len - kWavHeaderSize) / sizeof(int16_t) * 1000 / 24000) + 1000;
+    speech_ms = std::min(speech_ms, 30000);
 
     hal_bridge::disply_lvgl_lock();
     if (sc.hasAvatar()) {
@@ -555,47 +550,41 @@ static bool do_stt_voice_chat()
     }
     hal_bridge::disply_lvgl_unlock();
 
-    play_wav(resp_ctx.buf, resp_ctx.len);
-    heap_caps_free(resp_ctx.buf);
+    play_wav(resp.buf, resp.len);
+    heap_caps_free(resp.buf);
 
-    ESP_LOGI(LOCAL_LLM_TAG, "Chat cycle done");
+    ESP_LOGI(kTag, "Chat cycle done");
     return true;
 }
 
-static void local_llm_task(void* pvParameters)
+static void voice_chat_task(void* /*pvParameters*/)
 {
-    // WiFi接続待ち（getWifiStatus ポーリング）
-    ESP_LOGI(LOCAL_LLM_TAG, "Waiting for WiFi...");
-    const int kWifiMaxMs  = 60000;
-    const int kWifiStepMs = 1000;
+    // WiFi接続待ち（最大60秒、1秒ポーリング）
+    ESP_LOGI(kTag, "Waiting for WiFi...");
     bool wifi_ok = false;
-    for (int waited = 0; waited < kWifiMaxMs; waited += kWifiStepMs) {
-        if (GetHAL().getWifiStatus() != WifiStatus::None) {
-            wifi_ok = true;
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(kWifiStepMs));
+    for (int t = 0; t < 60000; t += 1000) {
+        if (GetHAL().getWifiStatus() != WifiStatus::None) { wifi_ok = true; break; }
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     if (!wifi_ok) {
-        ESP_LOGW(LOCAL_LLM_TAG, "WiFi not connected after %ds, aborting", kWifiMaxMs / 1000);
+        ESP_LOGW(kTag, "WiFi timeout, aborting");
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(LOCAL_LLM_TAG, "WiFi connected");
+    ESP_LOGI(kTag, "WiFi connected");
 
-    // アバター準備待ち
     if (!wait_for_avatar()) {
-        ESP_LOGW(LOCAL_LLM_TAG, "Avatar not ready, aborting");
+        ESP_LOGW(kTag, "Avatar not ready, aborting");
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(LOCAL_LLM_TAG, "Avatar ready. Starting voice chat loop...");
+    ESP_LOGI(kTag, "Starting voice chat loop...");
+    // オーディオハードウェアの安定化を待つ
+    vTaskDelay(pdMS_TO_TICKS(2000));
 
-    // 会話ループ
     while (true) {
         do_stt_voice_chat();
-        // 次の録音まで少し間隔を開ける
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(500));  // 次サイクルまでの待機
     }
 }
 
@@ -605,8 +594,12 @@ void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
 {
     mclog::tagInfo(_tag, "init");
 
-    // STT+LLM+TTS 会話ループタスクを起動
-    xTaskCreate(local_llm_task, "local_llm", 24576, nullptr, 5, nullptr);
+    // 音声会話タスク起動（録音 → STT → LLM → TTS の連続ループ）
+    // 静的ハンドルで多重起動を防ぐ
+    static TaskHandle_t s_voice_task = nullptr;
+    if (s_voice_task == nullptr) {
+        xTaskCreate(voice_chat_task, "voice_chat", 24576, nullptr, 5, &s_voice_task);
+    }
 
     /* ------------------------------ Screen setup ------------------------------ */
     ScreenActive screen;

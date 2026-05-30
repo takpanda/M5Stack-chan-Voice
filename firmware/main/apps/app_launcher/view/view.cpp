@@ -578,13 +578,21 @@ static void voice_chat_task(void* /*pvParameters*/)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(kTag, "Starting voice chat loop...");
+    ESP_LOGI(kTag, "Waiting for wake word...");
     // オーディオハードウェアの安定化を待つ
     vTaskDelay(pdMS_TO_TICKS(2000));
 
+    auto& audio_svc = Application::GetInstance().GetAudioService();
+    uint32_t last_wake_word_count = audio_svc.GetWakeWordDetectedCount();
+
     while (true) {
-        do_stt_voice_chat();
-        vTaskDelay(pdMS_TO_TICKS(500));  // 次サイクルまでの待機
+        uint32_t current_count = audio_svc.GetWakeWordDetectedCount();
+        if (current_count != last_wake_word_count) {
+            last_wake_word_count = current_count;
+            ESP_LOGI(kTag, "Wake word detected, starting voice chat...");
+            do_stt_voice_chat();
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
@@ -594,8 +602,11 @@ void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
 {
     mclog::tagInfo(_tag, "init");
 
-    // 音声会話タスク起動（録音 → STT → LLM → TTS の連続ループ）
+    // 音声会話タスク起動（wake word で会話開始）
     // 静的ハンドルで多重起動を防ぐ
+    auto& audio_svc = Application::GetInstance().GetAudioService();
+    audio_svc.EnableWakeWordDetection(true);
+
     static TaskHandle_t s_voice_task = nullptr;
     if (s_voice_task == nullptr) {
         xTaskCreate(voice_chat_task, "voice_chat", 24576, nullptr, 5, &s_voice_task);

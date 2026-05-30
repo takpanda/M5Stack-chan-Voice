@@ -1,0 +1,5 @@
+0000000000000000000000000000000000000000 da156e1fa0e1c2a5e00b78fbf69b1f7e7bca0483 T.Aoki <tak.aoki.jp@gmail.com> 1780067977 +0900	branch: Created from HEAD
+da156e1fa0e1c2a5e00b78fbf69b1f7e7bca0483 d48b36ccafe97585eacd2a63579f84def20cb8e9 T.Aoki <tak.aoki.jp@gmail.com> 1780102208 +0900	commit: Add I2C probe for IO Expander initialization and log if not found
+d48b36ccafe97585eacd2a63579f84def20cb8e9 b9010b92bcf18cd1fafa645812595335bc2b70b6 T.Aoki <tak.aoki.jp@gmail.com> 1780103179 +0900	commit: 音声会話ループのリファクタリングと定数の整理
+b9010b92bcf18cd1fafa645812595335bc2b70b6 7ad60cbd86ee729df1acc273ebdbacf563edac06 T.Aoki <tak.aoki.jp@gmail.com> 1780103256 +0900	commit: 音声会話タスクの起動条件を変更し、ウェイクワード検出時に会話を開始するように修正
+7ad60cbd86ee729df1acc273ebdbacf563edac06 520665c58590a26861eeace7c2e7b6fd18cbfe20 T.Aoki <tak.aoki.jp@gmail.com> 1780104909 +0900	commit: README.mdを新規作成し、StackChanのオープンソースリソースと製品情報を追加

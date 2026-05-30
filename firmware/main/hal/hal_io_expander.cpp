@@ -17,7 +17,15 @@ void Hal::io_expander_init()
 {
     mclog::tagInfo(_tag, "init");
 
-    auto i2c_bus        = hal_bridge::board_get_i2c_bus();
+    auto i2c_bus = hal_bridge::board_get_i2c_bus();
+
+    // I2Cバスをプローブして物理的に存在するか確認する
+    // サーボハットが未接続の場合はここでスキップし、エラーログを出さない
+    if (i2c_master_probe(i2c_bus, m5::PY32IOExpander_Class::DEFAULT_ADDRESS, 200) != ESP_OK) {
+        mclog::tagInfo(_tag, "IO Expander not found, skipping");
+        return;
+    }
+
     _io_expander        = std::make_unique<m5::PY32IOExpander_Class>(i2c_bus);
     uint32_t start_tick = GetHAL().millis();
 

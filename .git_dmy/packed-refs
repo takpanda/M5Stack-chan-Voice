@@ -1,7 +1,0 @@
-# pack-refs with: peeled fully-peeled sorted 
-ad47f0ba99fa51a1836522c7baa186393a8a8dc3 refs/remotes/origin/docs-dev
-da156e1fa0e1c2a5e00b78fbf69b1f7e7bca0483 refs/remotes/origin/firmware-dev
-4f87087a7da70ce32598941e3dc440cb12880056 refs/remotes/origin/ios-dev
-da156e1fa0e1c2a5e00b78fbf69b1f7e7bca0483 refs/remotes/origin/main
-f71b5ccdd6bb20bc45bfae4a500e15d3e7f29a2a refs/remotes/origin/remote-dev
-d990e6d3b39b077af3c42cce084af5fc3b2d8705 refs/remotes/origin/server-dev
